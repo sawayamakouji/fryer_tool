@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="ja"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>06 商品×日別×店別 POS抽出</title>
+<link rel="stylesheet" href="./assets/app.css"/>
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+</head><body>
+<header>
+  <div>
+    <h1>チラシ×POS ローカル処理ツール（分割版）</h1>
+    <small>
+      期間(start/end)に含まれる<strong>販売日(date)</strong>ごとの店別数量/金額を出力します。<br/>
+      03の出力が <code>flyer_store_jan_period.csv</code>（active_start/active_end）の場合は、ここで日別に展開します。
+    </small>
+  </div>
+  <nav>
+    <a href="./index.html">index</a>
+    <a href="./01_import_items.html">01 商品</a>
+    <a href="./02_normalize_stores.html">02 店舗</a>
+    <a href="./03_parse_periods.html">03 期間</a>
+    <a href="./04_join_pos.html">04 結合</a>
+    <a href="./05_pos_store_map.html">05 POS店舗対応</a>
+    <a href="./06_item_daily_pos.html">06 日別POS</a>
+  </nav>
+</header>
+
+<div class="row">
+  <div class="card">
+    <h3>入力</h3>
+    <label>flyer_store_jan_period.csv（03の出力：active_start/active_end）または flyer_store_jan_date.csv（既に日別）</label>
+    <input id="fileFlyer" type="file" accept=".csv"/>
+    <label style="margin-top:10px;">POS CSV（combined_fixed.csv 等）</label>
+    <input id="filePos" type="file" accept=".csv"/>
+    <label style="margin-top:10px;">shoplist.csv（任意：POSに店名列が無い場合に店名補完）</label>
+    <input id="fileShop" type="file" accept=".csv"/>
+    <div style="margin-top:12px;">
+      <button id="run">06 実行（結合）</button>
+      <button id="dl">日別CSVダウンロード</button>
+    </div>
+    <small>
+      大きいPOSでも動くように、先にチラシ側のキー集合（date+store_id+jan）を作り、POSは一致キーのみ集計します。
+    </small>
+  </div>
+
+  <div class="card">
+    <h3>プレビュー（最大200件）</h3>
+    <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
+      <label style="margin:0;">JANフィルタ</label>
+      <input id="janFilter" placeholder="例: 4549414520606" style="flex:1;"/>
+      <button id="applyFilter">適用</button>
+      <button id="clearFilter">クリア</button>
+    </div>
+    <div id="stats"></div>
+    <div style="max-height:320px; overflow:auto;">
+      <table id="tbl"><thead><tr>
+        <th>flyer_id</th><th>store_id</th><th>store_name</th><th>jan</th><th>date</th>
+        <th>sales_qty</th><th>sales_amt</th>
+        <th>period_start</th><th>period_end</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+
+  <div class="card"><h3>ログ</h3><pre id="log"></pre></div>
+</div>
+
+<script type="module">
+import { readJson, appendLog, downloadCSV } from "./assets/core/io.js";
+import { nfkc, normalizeStoreId } from "./assets/core/normalize.js";
+import { save, load } from "./assets/core/state.js";
+
+const log = document.getElementById("log");
+const stats = document.getElementById("stats");
+const tbody = document.querySelector("#tbl tbody");
+
+function stripBOM(s){ return (typeof s === "string") ? s.replace(/^\uFEFF/, "") : s; }
+
+function parseYMD(v){
+  const s = String(v||"").trim();
+  const m = s.match(/(\d{4})\D+(\d{1,2})\D+(\d{1,2})/);
+  if (!m) return null;
+  const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+  if (!y || !mo || !d) return null;
+  return `${y}-${String(mo).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+}
+
+function addDaysISO(iso, days){
+  const m = String(iso||"").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const dt = new Date(Number(m[1]), Number(m[2])-1, Number(m[3]));
+  dt.setDate(dt.getDate() + Number(days||0));
+  const y = dt.getFullYear();
+  const mo = String(dt.getMonth()+1).padStart(2,"0");
+  const d = String(dt.getDate()).padStart(2,"0");
+  return `${y}-${mo}-${d}`;
+}
+
+function daysBetweenInclusive(startIso, endIso){
+  const s = startIso && parseYMD(startIso);
+  const e = endIso && parseYMD(endIso);
+  if (!s || !e) return 0;
+  const sd = new Date(Number(s.slice(0,4)), Number(s.slice(5,7))-1, Number(s.slice(8,10)));
+  const ed = new Date(Number(e.slice(0,4)), Number(e.slice(5,7))-1, Number(e.slice(8,10)));
+  const diff = Math.floor((ed - sd) / (24*3600*1000));
+  return diff + 1;
+}
+
+function toNumber(v){
+  if (v === null || v === undefined) return 0;
+  const s = String(v).replace(/,/g,"").trim();
+  const n = Number(s);
+  return Number.isFinite(n) ? n : 0;
+}
+
+async function readCsvAll(file){
+  return new Promise((resolve,reject)=>Papa.parse(file,{
+    header:true, skipEmptyLines:true,
+    transformHeader:(h)=>stripBOM(String(h||"")).trim(),
+    complete:r=>resolve(r.data),
+    error:reject
+  }));
+}
+
+function pickCol(sample, candidates){
+  const keys = Object.keys(sample||{});
+  for (const c of (candidates||[])){
+    const cc = stripBOM(String(c||"")).trim();
+    if (cc in (sample||{})) return cc;
+    const hit = keys.find(k => stripBOM(k).trim() === cc);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function buildShopMap(shops){
+  const sample = shops[0]||{};
+  const cId = pickCol(sample, ["store_id","StoreID","店舗コード","店コード"]);
+  const cName = pickCol(sample, ["store_name","StoreName","店舗名","店名"]);
+  const map = new Map();
+  for (const r of shops){
+    const id = normalizeStoreId(r[cId]);
+    const name = nfkc(String(r[cName]||"")).trim();
+    if (id && name) map.set(id, name);
+  }
+  return map;
+}
+
+document.getElementById("run").addEventListener("click", async ()=>{
+  const fFlyer = document.getElementById("fileFlyer").files[0];
+  const fPos = document.getElementById("filePos").files[0];
+  const fShop = document.getElementById("fileShop").files[0];
+
+  if (!fFlyer) return appendLog(log, "03の出力CSV 未選択（flyer_store_jan_period.csv 推奨）");
+  if (!fPos) return appendLog(log, "POS CSV 未選択");
+
+  const SETTINGS = (await readJson("./config/settings.json").catch(()=>({}))) || {};
+  const posCandidates = SETTINGS.pos_columns_candidates || {};
+
+  // 1) Load flyer rows (period or date)
+  appendLog(log, "チラシCSVを読み込み中…");
+  const flyerRowsRaw = await readCsvAll(fFlyer);
+  const flyerSample = flyerRowsRaw[0]||{};
+
+  const cFlyerId = pickCol(flyerSample, ["flyer_id","ファイル名"]);
+  const cStoreId = pickCol(flyerSample, ["store_id","店舗コード","店コード"]);
+  const cStoreName = pickCol(flyerSample, ["store_name","店名","店舗名"]);
+  const cJan = pickCol(flyerSample, ["jan","JAN","スキャンコード","商品"]);
+
+  // If "date" exists => already daily. Else expect active_start/active_end => expand here.
+  const cDate = pickCol(flyerSample, ["date","日付","販売日"]);
+  const cAStart = pickCol(flyerSample, ["active_start","period_start","開始","start_date"]);
+  const cAEnd = pickCol(flyerSample, ["active_end","period_end","終了","end_date"]);
+
+  if (!cFlyerId || !cStoreId || !cJan){
+    appendLog(log, `必須列が見つかりません flyer_id=${cFlyerId} store_id=${cStoreId} jan=${cJan}`);
+    return;
+  }
+
+  const flyerRows = [];
+  const keySet = new Set();
+  let expanded = 0;
+
+  for (const r of flyerRowsRaw){
+    const flyer_id = String(r[cFlyerId]||"").trim();
+    const store_id = normalizeStoreId(r[cStoreId]);
+    const jan = String(r[cJan]||"").replace(/\D/g,"").trim();
+    const store_name = cStoreName ? nfkc(String(r[cStoreName]||"")).trim() : "";
+    if (!flyer_id || !store_id || !jan) continue;
+
+    if (cDate){
+      const date = parseYMD(r[cDate]) || String(r[cDate]||"").trim();
+      if (!date) continue;
+      const key = `${date}||${store_id}||${jan}`;
+      keySet.add(key);
+      flyerRows.push({flyer_id, store_id, store_name, jan, date, period_start:"", period_end:""});
+    } else {
+      // expand from active_start/end
+      const ps = parseYMD(r[cAStart]) || String(r[cAStart]||"").trim();
+      const pe = parseYMD(r[cAEnd]) || String(r[cAEnd]||"").trim();
+      if (!ps || !pe) continue;
+
+      const nDays = daysBetweenInclusive(ps, pe);
+      if (nDays <= 0) continue;
+      // safety guard (prevents runaway if data is broken)
+      if (nDays > 62){
+        appendLog(log, `WARN: 期間が長すぎるためスキップ flyer_id=${flyer_id} jan=${jan} start=${ps} end=${pe} days=${nDays}`);
+        continue;
+      }
+
+      for (let i=0; i<nDays; i++){
+        const date = addDaysISO(ps, i);
+        const key = `${date}||${store_id}||${jan}`;
+        keySet.add(key);
+        flyerRows.push({flyer_id, store_id, store_name, jan, date, period_start: ps, period_end: pe});
+        expanded++;
+      }
+    }
+  }
+
+  appendLog(log, `チラシ rows=${flyerRowsRaw.length} 展開後rows=${flyerRows.length} keys=${keySet.size} expanded=${expanded}`);
+
+  // 2) shoplist (optional)
+  let shopMap = new Map();
+  if (fShop){
+    appendLog(log, "shoplist を読み込み中…");
+    const shops = await readCsvAll(fShop);
+    shopMap = buildShopMap(shops);
+    appendLog(log, `shoplist 店数=${shopMap.size}`);
+  }
+
+  // 3) Scan POS with streaming, store only rows that match keys
+  appendLog(log, "POSをスキャン中（一致キーのみ保持）…");
+  let posCols = null;
+  const posMap = new Map();
+  let seen = 0, kept = 0;
+
+  await new Promise((resolve,reject)=>{
+    Papa.parse(fPos,{
+      header:true,
+      skipEmptyLines:true,
+      dynamicTyping:false,
+      transformHeader:(h)=>stripBOM(String(h||"")).trim(),
+      step:(results)=>{
+        const r = results.data;
+        if (!posCols){
+          const sample = r || {};
+          const cDatePos = pickCol(sample, posCandidates.date || ["【期間】","期間","date","Date","Unnamed: 0","\uFEFFUnnamed: 0","﻿Unnamed: 0"]);
+          const cStoreIdPos = pickCol(sample, posCandidates.store_id || ["【店舗】","店舗","store_id","StoreID","店舗コード"]);
+          const cStoreNamePos = pickCol(sample, posCandidates.store_name || ["【店舗】.1","店舗名","store_name","StoreName"]);
+          const cJanPos = pickCol(sample, posCandidates.jan || ["【商品】","商品","jan","JAN"]);
+          const cQtyPos = pickCol(sample, posCandidates.sales_qty || ["販売点数","数量","売上数量","sales_qty"]);
+          const cAmtPos = pickCol(sample, posCandidates.sales_amt || ["販売金額","金額","売上金額","sales_amt"]);
+          posCols = {cDatePos, cStoreIdPos, cStoreNamePos, cJanPos, cQtyPos, cAmtPos};
+          appendLog(log, `POS列 date=${cDatePos} store_id=${cStoreIdPos} store_name=${cStoreNamePos} jan=${cJanPos} qty=${cQtyPos} amt=${cAmtPos}`);
+          if (!cDatePos || !cStoreIdPos || !cJanPos || !cQtyPos || !cAmtPos){
+            reject(new Error("POS列特定失敗（date/store_id/jan/sales_qty/sales_amt のいずれか）"));
+            return;
+          }
+        }
+
+        seen++;
+        const date = parseYMD(r[posCols.cDatePos]) || String(r[posCols.cDatePos]||"").trim();
+        const store_id = normalizeStoreId(r[posCols.cStoreIdPos]);
+        const jan = String(r[posCols.cJanPos]||"").replace(/\D/g,"").trim();
+        if (!date || !store_id || !jan) return;
+
+        const key = `${date}||${store_id}||${jan}`;
+        if (!keySet.has(key)) return;
+
+        kept++;
+        const qty = toNumber(r[posCols.cQtyPos]);
+        const amt = toNumber(r[posCols.cAmtPos]);
+        const store_name = posCols.cStoreNamePos ? nfkc(String(r[posCols.cStoreNamePos]||"")).trim() : "";
+
+        if (!posMap.has(key)){
+          posMap.set(key, {sales_qty: qty, sales_amt: amt, store_name});
+        } else {
+          const cur = posMap.get(key);
+          cur.sales_qty += qty;
+          cur.sales_amt += amt;
+          if (!cur.store_name && store_name) cur.store_name = store_name;
+        }
+      },
+      complete:()=>resolve(),
+      error:reject
+    });
+  }).catch(e=>{
+    appendLog(log, `ERROR: ${e.message}`);
+    throw e;
+  });
+
+  appendLog(log, `POS scan seen=${seen} kept=${kept} matchedKeys=${posMap.size}`);
+
+  // 4) Build output rows = flyerRows joined with posMap
+  const out = flyerRows.map(fr=>{
+    const key = `${fr.date}||${fr.store_id}||${fr.jan}`;
+    const hit = posMap.get(key);
+    const store_name = (hit?.store_name) || fr.store_name || (shopMap.get(fr.store_id) || "");
+    return {
+      flyer_id: fr.flyer_id,
+      store_id: fr.store_id,
+      store_name,
+      jan: fr.jan,
+      date: fr.date, // 販売日
+      sales_qty: hit ? hit.sales_qty : 0,
+      sales_amt: hit ? hit.sales_amt : 0,
+      period_start: fr.period_start || "",
+      period_end: fr.period_end || ""
+    };
+  });
+
+  await save("item_daily_pos", out);
+  await save("item_daily_pos_all", out);
+
+  appendLog(log, `出力 rows=${out.length}`);
+  renderPreview(out, "");
+});
+
+function renderPreview(rows, janFilter){
+  const f = String(janFilter||"").replace(/\D/g,"").trim();
+  const filtered = f ? rows.filter(r=>String(r.jan)===f) : rows;
+  stats.innerHTML = `rows=<b>${rows.length}</b> / filtered=<b>${filtered.length}</b>`;
+  tbody.innerHTML = "";
+  filtered.slice(0,200).forEach(r=>{
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${r.flyer_id}</td><td>${r.store_id}</td><td>${r.store_name}</td><td>${r.jan}</td><td>${r.date}</td><td>${r.sales_qty}</td><td>${r.sales_amt}</td><td>${r.period_start||""}</td><td>${r.period_end||""}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+document.getElementById("applyFilter").addEventListener("click", async ()=>{
+  const rows = await load("item_daily_pos_all") || [];
+  renderPreview(rows, document.getElementById("janFilter").value);
+});
+document.getElementById("clearFilter").addEventListener("click", async ()=>{
+  document.getElementById("janFilter").value = "";
+  const rows = await load("item_daily_pos_all") || [];
+  renderPreview(rows, "");
+});
+
+document.getElementById("dl").addEventListener("click", async ()=>{
+  const out = await load("item_daily_pos") || [];
+  if (!out.length) return appendLog(log, "出力がありません（06 実行後にDL）");
+  downloadCSV("flyer_item_store_daily_pos.csv", out);
+});
+</script>
+</body></html>

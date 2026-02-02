@@ -1,0 +1,26 @@
+{
+  "sets": {
+    "@ALL_GMS": {
+      "store_format": [
+        "GMS"
+      ]
+    },
+    "@ALL_SM": {
+      "store_format": [
+        "SM",
+        "MV"
+      ]
+    }
+  },
+  "token_expansions": {
+    "GMS": [
+      "@ALL_GMS"
+    ],
+    "SM": [
+      "@ALL_SM"
+    ],
+    "A滝川": [
+      "滝川"
+    ]
+  }
+}

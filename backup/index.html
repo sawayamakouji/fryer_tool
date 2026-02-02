@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ja"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>flyer tool index</title>
+<link rel="stylesheet" href="./assets/app.css"/>
+</head><body>
+<header>
+  <div>
+    <h1>チラシ×POS ローカル処理ツール（分割版）</h1>
+    <small>本雛形はCDN依存。オフライン化する場合は script src をローカルに変更。</small>
+  </div>
+  <nav>
+    <a href="./index.html">index</a>
+    <a href="./01_import_items.html">01 商品</a>
+    <a href="./02_normalize_stores.html">02 店舗</a>
+    <a href="./03_parse_periods.html">03 期間</a>
+    <a href="./04_join_pos.html">04 結合</a>
+  </nav>
+</header>
+<div class="row">
+  <div class="card">
+    <h3>推奨フロー</h3>
+    <ol>
+      <li><b>01 商品</b>：p.xlsx読込→JAN文字列化→IndexedDB保存</li>
+      <li><b>02 店舗</b>：shoplist.csv→R列トークン展開→未解決トークン抽出</li>
+      <li><b>03 期間</b>：期間パース確認→active期間→IndexedDB保存</li>
+      <li><b>04 結合</b>：combined.csv→期間合計（agg）CSV出力</li>
+    </ol>
+    <p>設定: <code>config/settings.json</code>／例外: <code>config/store_rules.json</code> <code>config/token_aliases.json</code></p>
+  </div>
+  <div class="card">
+    <h3>状態</h3>
+    <button id="clear">保存データを全削除</button>
+    <pre id="log"></pre>
+  </div>
+</div>
+<script type="module">
+import { appendLog } from "./assets/core/io.js";
+import { clearAll } from "./assets/core/state.js";
+const log = document.getElementById("log");
+document.getElementById("clear").addEventListener("click", async ()=>{
+  await clearAll();
+  appendLog(log, "IndexedDB をクリアしました。");
+});
+</script>
+</body></html>

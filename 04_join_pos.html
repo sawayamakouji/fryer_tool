@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="ja"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>04 POS結合</title>
+<link rel="stylesheet" href="./assets/app.css"/>
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head><body>
+<header>
+  <div>
+    <h1>チラシ×POS ローカル処理ツール（分割版）</h1>
+    <small>本雛形はCDN依存。オフライン化する場合は script src をローカルに変更。</small>
+  </div>
+  <nav>
+    <a href="./index.html">index</a>
+    <a href="./01_import_items.html">01 商品</a>
+    <a href="./02_normalize_stores.html">02 店舗</a>
+    <a href="./03_parse_periods.html">03 期間</a>
+    <a href="./04_join_pos.html">04 結合</a>
+  </nav>
+</header>
+<div class="row">
+  <div class="card">
+    <h3>入力</h3>
+    <label>combined.csv</label>
+    <input id="filePOS" type="file" accept=".csv"/>
+    <div style="margin-top:12px;">
+      <button id="run">04 実行</button>
+      <button id="dl">agg CSV</button>
+    </div>
+    <small>列名が合わない場合は config/settings.json の pos_columns_candidates を調整。</small>
+  </div>
+  <div class="card"><h3>ログ</h3><pre id="log"></pre><div id="stats"></div></div>
+</div>
+<script type="module">
+import { readJson, appendLog, downloadCSV } from "./assets/core/io.js";
+import { load, save } from "./assets/core/state.js";
+import { buildPosMap, aggregateByPeriod } from "./assets/core/join.js";
+
+const settings = await readJson("./config/settings.json");
+const log = document.getElementById("log");
+const stats = document.getElementById("stats");
+
+async function readCsv(file){
+  return new Promise((resolve,reject)=>Papa.parse(file,{header:true,skipEmptyLines:true,complete:r=>resolve(r.data),error:reject}));
+}
+function pickCol(obj, cands){ for (const c of cands) if (c in obj) return c; return null; }
+
+document.getElementById("run").addEventListener("click", async ()=>{
+  const f = document.getElementById("filePOS").files[0];
+  if (!f) return appendLog(log, "combined.csv未選択");
+  const period = await load("flyer_store_jan_period") || [];
+  if (!period.length) return appendLog(log, "03のperiodがありません");
+
+  const posRows = await readCsv(f);
+  const sample = posRows[0] || {};
+  const cands = settings.pos_columns_candidates;
+  const colMap = {
+    date: pickCol(sample, cands.date),
+    store_id: pickCol(sample, cands.store_id),
+    jan: pickCol(sample, cands.jan),
+    sales_qty: pickCol(sample, cands.sales_qty),
+    sales_amt: pickCol(sample, cands.sales_amt)
+  };
+  for (const [k,v] of Object.entries(colMap)) if (!v) throw new Error(`POS列特定失敗: ${k}`);
+  appendLog(log, `POS列: ${JSON.stringify(colMap)}`);
+
+  const {map:posMap, scannedRows, keys} = buildPosMap(posRows, colMap);
+  appendLog(log, `POS keys=${keys} validRows=${scannedRows}`);
+
+  const agg = aggregateByPeriod(period, posMap);
+  await save("flyer_pos_agg", agg);
+
+  const matched = agg.reduce((a,r)=>a+(r.matched_days>0?1:0),0);
+  stats.textContent = `agg=${agg.length} matched_rows=${matched}`;
+});
+
+document.getElementById("dl").addEventListener("click", async ()=>{
+  const agg = await load("flyer_pos_agg") || [];
+  if (!agg.length) return appendLog(log, "aggなし");
+  const y = settings.target_year, m = String(settings.target_month).padStart(2,"0");
+  downloadCSV(`flyer_store_jan_period_pos_agg_${y}-${m}.csv`, agg);
+});
+</script>
+</body></html>

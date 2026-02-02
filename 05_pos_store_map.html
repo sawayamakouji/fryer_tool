@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="ja"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>05 POS店舗⇄shoplist 対応表</title>
+<link rel="stylesheet" href="./assets/app.css"/>
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+</head><body>
+<header>
+  <div>
+    <h1>チラシ×POS ローカル処理ツール（分割版）</h1>
+    <small>POS（PCSV）店舗名/店コード と shoplist の対応表（辞書）を作ります。</small>
+  </div>
+  <nav>
+    <a href="./index.html">index</a>
+    <a href="./01_import_items.html">01 商品</a>
+    <a href="./02_normalize_stores.html">02 店舗</a>
+    <a href="./03_parse_periods.html">03 期間</a>
+    <a href="./04_join_pos.html">04 結合</a>
+    <a href="./05_pos_store_map.html">05 POS店舗対応</a>
+  </nav>
+</header>
+
+<div class="row">
+  <div class="card">
+    <h3>入力</h3>
+    <label>shoplist.csv（基準マスタ）</label>
+    <input id="fileShop" type="file" accept=".csv"/>
+    <label style="margin-top:10px;">POS CSV（combined_fixed.csv 等）</label>
+    <input id="filePos" type="file" accept=".csv"/>
+    <div style="margin-top:12px;">
+      <button id="run">05 実行</button>
+      <button id="dlMap">対応表CSV</button>
+      <button id="dlUnmatched">未解決CSV</button>
+    </div>
+    <small>
+      まずは <b>store_id</b>（店舗コード）で突合します。無い/不一致の場合は店名で補助突合します（曖昧なら未解決に残します）。
+    </small>
+  </div>
+
+  <div class="card">
+    <h3>サマリー</h3>
+    <div id="stats"></div>
+    <div style="max-height:320px; overflow:auto;">
+      <table id="tbl"><thead>
+        <tr>
+          <th>pos_store_id</th><th>pos_store_name</th><th>match_method</th><th>shop_store_id</th><th>shop_store_name</th><th>shop_format</th>
+        </tr>
+      </thead><tbody></tbody></table>
+    </div>
+    <small>表示は最大300件。全件はCSVでダウンロード。</small>
+  </div>
+
+  <div class="card"><h3>ログ</h3><pre id="log"></pre></div>
+</div>
+
+<script type="module">
+import { readJson, appendLog, downloadCSV } from "./assets/core/io.js";
+import { nfkc, stripAffixes, normalizeStoreId } from "./assets/core/normalize.js";
+import { save, load } from "./assets/core/state.js";
+
+const log = document.getElementById("log");
+const stats = document.getElementById("stats");
+const tbody = document.querySelector("#tbl tbody");
+
+function stripBOM(s){
+  if (typeof s !== "string") return s;
+  return s.replace(/^\uFEFF/, "");
+}
+
+async function readCsv(file){
+  return new Promise((resolve,reject)=>Papa.parse(file,{
+    header:true,
+    skipEmptyLines:true,
+    dynamicTyping:false,
+    transformHeader:(h)=>stripBOM(String(h||"")).trim(),
+    complete:r=>resolve(r.data),
+    error:reject
+  }));
+}
+
+function pickColFromCandidates(sample, candidates){
+  const keys = Object.keys(sample||{}).map(k=>String(k));
+  for (const c of (candidates||[])){
+    const cc = stripBOM(String(c||"")).trim();
+    if (cc in (sample||{})) return cc;
+    const hit = keys.find(k => stripBOM(k).trim() === cc);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function buildShopIndex(shops, SETTINGS){
+  const prefixes = Array.isArray(SETTINGS.strip_prefixes) ? SETTINGS.strip_prefixes : ["MV","ＭＶ","札幌","旭川","函館","苫小牧","帯広","北見","釧路","小樽"];
+  const suffixes = Array.isArray(SETTINGS.strip_suffixes) ? SETTINGS.strip_suffixes : ["店","店舗"];
+
+  const sample = shops[0]||{};
+  const cId = pickColFromCandidates(sample, ["store_id","StoreID","店舗コード","店コード","storeCode","StoreCode"]);
+  const cName = pickColFromCandidates(sample, ["store_name","StoreName","店舗名","店名","storeName"]);
+  const cFmt = pickColFromCandidates(sample, ["store_format","StoreFormat","フォーマット","業態","format","業態区分"]);
+
+  const byId = new Map();
+  const byExact = new Map();
+  const byStripped = new Map();
+  const all = [];
+
+  for (const r of shops){
+    const store_id = normalizeStoreId(r[cId]);
+    const store_name = nfkc(String(r[cName]||"")).trim();
+    const store_format = nfkc(String(r[cFmt]||"")).trim();
+    if (!store_id || !store_name) continue;
+
+    const store = {store_id, store_name, store_format};
+    byId.set(store_id, store);
+    byExact.set(store_name, store);
+    all.push(store);
+
+    const stripped = stripAffixes(store_name, prefixes, suffixes);
+    if (!byStripped.has(stripped)) byStripped.set(stripped, []);
+    byStripped.get(stripped).push(store);
+  }
+
+  return {byId, byExact, byStripped, all, prefixes, suffixes};
+}
+
+function normalizePosName(s){
+  return nfkc(String(s||"")).trim().replace(/[\s]+/g,"");
+}
+
+function resolvePosStore(pos_store_id_raw, pos_store_name_raw, shopIndex){
+  const pos_store_id = normalizeStoreId(pos_store_id_raw);
+  const pos_store_name = nfkc(String(pos_store_name_raw||"")).trim();
+
+  if (pos_store_id && shopIndex.byId.has(pos_store_id)){
+    const hit = shopIndex.byId.get(pos_store_id);
+    return {hit, method:"id", candidates:1};
+  }
+
+  if (pos_store_name && shopIndex.byExact.has(pos_store_name)){
+    const hit = shopIndex.byExact.get(pos_store_name);
+    return {hit, method:"name", candidates:1};
+  }
+
+  const stripped = stripAffixes(pos_store_name, shopIndex.prefixes, shopIndex.suffixes);
+  const list = shopIndex.byStripped.get(stripped) || shopIndex.byStripped.get(stripped.replace(/店$/,"")) || [];
+  if (list.length === 1){
+    return {hit:list[0], method:"stripped", candidates:1};
+  }
+  if (list.length > 1){
+    return {hit:null, method:"ambiguous", candidates:list.length};
+  }
+
+  const t = normalizePosName(stripped || pos_store_name);
+  if (!t) return {hit:null, method:"unmatched", candidates:0};
+
+  const stripShop = (nm)=>normalizePosName(stripAffixes(nm, shopIndex.prefixes, shopIndex.suffixes));
+  let ends = shopIndex.all.filter(s=>stripShop(s.store_name).endsWith(t));
+  if (!ends.length) ends = shopIndex.all.filter(s=>stripShop(s.store_name).includes(t));
+
+  if (ends.length === 1){
+    return {hit:ends[0], method:"fuzzy", candidates:1};
+  }
+  if (ends.length > 1){
+    return {hit:null, method:"ambiguous", candidates:ends.length};
+  }
+  return {hit:null, method:"unmatched", candidates:0};
+}
+
+document.getElementById("run").addEventListener("click", async ()=>{
+  const fShop = document.getElementById("fileShop").files[0];
+  const fPos  = document.getElementById("filePos").files[0];
+  if (!fShop) return appendLog(log, "shoplist.csv 未選択");
+  if (!fPos)  return appendLog(log, "POS CSV 未選択");
+
+  const SETTINGS = (await readJson("./config/settings.json").catch(()=>({}))) || {};
+  const posCandidates = (SETTINGS.pos_columns_candidates || {});
+
+  const shops = await readCsv(fShop);
+  const shopIndex = buildShopIndex(shops, SETTINGS);
+
+  const posRows = await readCsv(fPos);
+  const sample = posRows[0] || {};
+
+  const cPosStoreId = pickColFromCandidates(sample, posCandidates.store_id || ["【店舗】","店舗","store_id","StoreID","店舗コード"]);
+  const cPosStoreName = pickColFromCandidates(sample, posCandidates.store_name || ["【店舗】.1","店舗名","store_name","StoreName"]);
+
+  appendLog(log, `POS列 store_id=${cPosStoreId||"(未検出)"} store_name=${cPosStoreName||"(未検出)"}`);
+
+  const uniq = new Map();
+  for (const r of posRows){
+    const sid = cPosStoreId ? r[cPosStoreId] : "";
+    const snm = cPosStoreName ? r[cPosStoreName] : "";
+    const hasId = Boolean(normalizeStoreId(sid));
+    const key = hasId ? (normalizeStoreId(sid) + "||" + normalizePosName(snm)) : ("NAME||"+normalizePosName(snm));
+    if (!uniq.has(key)) uniq.set(key, {pos_store_id_raw:sid, pos_store_name_raw:snm});
+  }
+
+  const mapping = [];
+  const unmatched = [];
+
+  for (const v of uniq.values()){
+    const res = resolvePosStore(v.pos_store_id_raw, v.pos_store_name_raw, shopIndex);
+    if (res.hit){
+      mapping.push({
+        pos_store_id_raw: v.pos_store_id_raw,
+        pos_store_name_raw: v.pos_store_name_raw,
+        shop_store_id: res.hit.store_id,
+        shop_store_name: res.hit.store_name,
+        shop_store_format: res.hit.store_format,
+        match_method: res.method,
+        candidates: res.candidates
+      });
+    } else {
+      unmatched.push({
+        pos_store_id_raw: v.pos_store_id_raw,
+        pos_store_name_raw: v.pos_store_name_raw,
+        match_method: res.method,
+        candidates: res.candidates
+      });
+    }
+  }
+
+  await save("pos_store_map", mapping);
+  await save("pos_store_unmatched", unmatched);
+
+  tbody.innerHTML = "";
+  mapping.slice(0, 300).forEach(r=>{
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${r.pos_store_id_raw||""}</td><td>${r.pos_store_name_raw||""}</td><td>${r.match_method}</td><td>${r.shop_store_id||""}</td><td>${r.shop_store_name||""}</td><td>${r.shop_store_format||""}</td>`;
+    tbody.appendChild(tr);
+  });
+
+  stats.innerHTML = `POSユニーク店舗: <b>${uniq.size}</b> ／ 対応: <span class="${mapping.length?"tag-ok":"tag-ng"}">${mapping.length}</span> ／ 未解決: <span class="${unmatched.length?"tag-ng":"tag-ok"}">${unmatched.length}</span>`;
+  appendLog(log, `mapping=${mapping.length} unmatched=${unmatched.length}`);
+});
+
+document.getElementById("dlMap").addEventListener("click", async ()=>{
+  const out = await load("pos_store_map") || [];
+  if (!out.length) return appendLog(log, "対応表がありません（05 実行後に出力）");
+  downloadCSV("pos_store_name_map.csv", out);
+});
+document.getElementById("dlUnmatched").addEventListener("click", async ()=>{
+  const out = await load("pos_store_unmatched") || [];
+  if (!out.length) return appendLog(log, "未解決なし（または 05 未実行）");
+  downloadCSV("pos_store_unmatched.csv", out);
+});
+</script>
+</body></html>

@@ -1,0 +1,90 @@
+{
+  "target_year": 2025,
+  "target_month": 12,
+  "xlsx_sheet_name": "p",
+  "p_columns": {
+    "flyer_id": "ファイル名",
+    "flyer_period": "M列2行目",
+    "store_token": "R列2行目",
+    "jan": "スキャンコード",
+    "item_period": "期間",
+    "product_name": "商品名",
+    "sale_theme": "セールテーマ",
+    "dept_code": "部門コード",
+    "price_base": "本体価格",
+    "price_tax": "税込価格",
+    "margin": "値入率"
+  },
+  "pos_columns_candidates": {
+"date": [
+  "﻿Unnamed: 0",
+  "Unnamed: 0",
+  "【期間】",
+  "期間",
+  "date",
+  "Date"
+],
+
+    "store_id": [
+      "【店舗】",
+      "店舗",
+      "store_id",
+      "StoreID",
+      "店舗コード"
+    ],
+    "store_name": [
+      "【店舗】.1",
+      "店舗名",
+      "store_name",
+      "StoreName"
+    ],
+    "jan": [
+      "【商品】",
+      "商品",
+      "jan",
+      "JAN"
+    ],
+    "product_name": [
+      "【商品】.1",
+      "商品名",
+      "product_name"
+    ],
+   "sales_qty": [
+  "数量",
+  "売上数量",
+  "販売数量",
+  "販売点数",
+  "sales_qty"
+    ],
+  "sales_amt": [
+  "金額",
+  "売上金額",
+  "販売金額",
+  "sales_amt"
+    ]
+  },
+  "token_split_delimiters_regex": "[・、,／\\s]+",
+  "drop_tokens_containing": [
+    "除外",
+    "対象外"
+  ],
+  "flyer_type_rule": {
+    "if_filename_contains": "SM",
+    "then_type": "MV",
+    "else_type": "GMS"
+  },
+  "strip_prefixes": [
+    "SM",
+    "ＧＭＳ",
+    "GMS",
+    "ＭＶ",
+    "MV",
+    "マックスバリュ",
+    "札幌",
+    "旭川"
+  ],
+  "strip_suffixes": [
+    "店",
+    "店舗"
+  ]
+}

@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="ja"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>03 期間パース</title>
+<link rel="stylesheet" href="./assets/app.css"/>
+</head><body>
+<header>
+  <div>
+    <h1>チラシ×POS ローカル処理ツール（分割版）</h1>
+    <small>本雛形はCDN依存。オフライン化する場合は script src をローカルに変更。</small>
+  </div>
+  <nav>
+    <a href="./index.html">index</a>
+    <a href="./01_import_items.html">01 商品</a>
+    <a href="./02_normalize_stores.html">02 店舗</a>
+    <a href="./03_parse_periods.html">03 期間</a>
+    <a href="./04_join_pos.html">04 結合</a>
+  </nav>
+</header>
+<div class="row">
+  <div class="card">
+    <h3>実行</h3>
+    <button id="run">03 実行</button>
+    <button id="dl">period CSV</button>
+    <button id="dlBad">bad CSV</button>
+    <small>入力は IndexedDB: flyer_master / flyer_items / flyer_store_normalized</small>
+  </div>
+  <div class="card">
+    <h3>期間ユニーク値（上位）</h3>
+    <div style="max-height:320px; overflow:auto;">
+      <table id="tbl"><thead><tr><th>kind</th><th>raw</th><th>parsed_kind</th><th>start</th><th>end</th><th>count</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+  <div class="card"><h3>ログ</h3><pre id="log"></pre></div>
+</div>
+<script type="module">
+import { readJson, appendLog, downloadCSV } from "./assets/core/io.js";
+import { parsePeriodFixedYM, dateKey } from "./assets/core/period.js";
+import { load, save } from "./assets/core/state.js";
+
+const settings = await readJson("./config/settings.json");
+const log = document.getElementById("log");
+const tbody = document.querySelector("#tbl tbody");
+
+function topCounts(values, topN=30){
+  const m = new Map();
+  for (const v of values){ const k = String(v ?? ""); m.set(k, (m.get(k)||0)+1); }
+  return Array.from(m.entries()).sort((a,b)=>b[1]-a[1]).slice(0, topN);
+}
+
+document.getElementById("run").addEventListener("click", async ()=>{
+  const master = await load("flyer_master") || [];
+  const items = await load("flyer_items") || [];
+  const stores = await load("flyer_store_normalized") || [];
+  if (!master.length || !items.length || !stores.length) return appendLog(log, "01/02の保存データ不足");
+
+  const year = settings.target_year, month = settings.target_month;
+  const masterById = new Map(master.map(x=>[x.flyer_id, x]));
+  const storesByFlyer = new Map();
+  for (const s of stores){
+    if (!storesByFlyer.has(s.flyer_id)) storesByFlyer.set(s.flyer_id, []);
+    storesByFlyer.get(s.flyer_id).push(s);
+  }
+
+  const flyerTop = topCounts(master.map(x=>x.flyer_period_raw), 30).map(([raw,count])=>{
+    const p = parsePeriodFixedYM(raw, year, month);
+    return {kind:"flyer", raw, p, count};
+  });
+  const itemTop = topCounts(items.map(x=>x.item_period_raw), 30).map(([raw,count])=>{
+    const p = parsePeriodFixedYM(raw, year, month);
+    return {kind:"item", raw, p, count};
+  });
+
+  tbody.innerHTML = "";
+  for (const row of [...flyerTop, ...itemTop]){
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${row.kind}</td><td>${row.raw}</td><td>${row.p.kind}</td><td>${row.p.start?dateKey(row.p.start):""}</td><td>${row.p.end?dateKey(row.p.end):""}</td><td>${row.count}</td>`;
+    tbody.appendChild(tr);
+  }
+
+  // item period by flyer_id+jan
+  const itemKey = new Map();
+  for (const it of items){
+    const fm = masterById.get(it.flyer_id); if (!fm) continue;
+    const p = parsePeriodFixedYM(it.item_period_raw, year, month);
+    const key = `${it.flyer_id}|${it.jan}`;
+    if (!itemKey.has(key)) itemKey.set(key, {...it, item_start:p.start, item_end:p.end});
+    else {
+      const cur = itemKey.get(key);
+      if (p.start && (!cur.item_start || p.start < cur.item_start)) cur.item_start = p.start;
+      if (p.end && (!cur.item_end || p.end > cur.item_end)) cur.item_end = p.end;
+    }
+  }
+
+  const out = [];
+  const bad = [];
+
+  for (const [key, it] of itemKey.entries()){
+    const fm = masterById.get(it.flyer_id);
+    const fs = fm.flyer_start ? new Date(fm.flyer_start) : null;
+    const fe = fm.flyer_end ? new Date(fm.flyer_end) : null;
+    if (!fs || !fe || isNaN(fs) || isNaN(fe)) { bad.push({flyer_id:it.flyer_id, jan:it.jan, reason:"flyer_period_missing"}); continue; }
+
+    const is = it.item_start || fs;
+    const ie = it.item_end || fe;
+
+    const as = is > fs ? is : fs;
+    const ae = ie < fe ? ie : fe;
+
+    if (ae < as) { bad.push({flyer_id:it.flyer_id, jan:it.jan, reason:"end<start", item_raw: it.item_period_raw, flyer_start: fm.flyer_start, flyer_end: fm.flyer_end}); continue; }
+
+    const st = storesByFlyer.get(it.flyer_id) || [];
+    if (!st.length) { bad.push({flyer_id:it.flyer_id, jan:it.jan, reason:"no_store"}); continue; }
+
+    for (const s of st){
+      out.push({
+        flyer_id: it.flyer_id,
+        flyer_type: fm.flyer_type,
+        store_id: s.store_id,
+        store_name: s.store_name,
+        store_format: s.store_format,
+        jan: it.jan,
+        product_name: it.product_name,
+        sale_theme: it.sale_theme,
+        active_start: dateKey(as),
+        active_end: dateKey(ae)
+      });
+    }
+  }
+
+  await save("flyer_store_jan_period", out);
+  await save("flyer_period_bad_rows", bad);
+  appendLog(log, `period_rows=${out.length} bad=${bad.length}`);
+});
+
+document.getElementById("dl").addEventListener("click", async ()=>{
+  const out = await load("flyer_store_jan_period") || [];
+  if (!out.length) return appendLog(log, "periodがありません");
+  downloadCSV("flyer_store_jan_period.csv", out);
+});
+document.getElementById("dlBad").addEventListener("click", async ()=>{
+  const out = await load("flyer_period_bad_rows") || [];
+  if (!out.length) return appendLog(log, "badなし");
+  downloadCSV("flyer_period_bad_rows.csv", out);
+});
+</script>
+</body></html>

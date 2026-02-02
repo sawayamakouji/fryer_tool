@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="ja"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>01 商品正規化</title>
+<link rel="stylesheet" href="./assets/app.css"/>
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head><body>
+<header>
+  <div>
+    <h1>チラシ×POS ローカル処理ツール（分割版）</h1>
+    <small>本雛形はCDN依存。オフライン化する場合は script src をローカルに変更。</small>
+  </div>
+  <nav>
+    <a href="./index.html">index</a>
+    <a href="./01_import_items.html">01 商品</a>
+    <a href="./02_normalize_stores.html">02 店舗</a>
+    <a href="./03_parse_periods.html">03 期間</a>
+    <a href="./04_join_pos.html">04 結合</a>
+  </nav>
+</header>
+<div class="row">
+  <div class="card">
+    <h3>入力</h3>
+    <label>p.xlsx（★チラシ明細）</label>
+    <input id="fileP" type="file" accept=".xlsx"/>
+    <div style="margin-top:12px;">
+      <button id="run">01 実行</button>
+      <button id="dlItems">items CSV</button>
+      <button id="dlMaster">master CSV</button>
+    </div>
+    <small>出力は IndexedDB に保存（flyer_master / flyer_items / flyer_store_tokens）。</small>
+  </div>
+  <div class="card"><h3>ログ</h3><pre id="log"></pre></div>
+</div>
+<script type="module">
+import { readJson, appendLog, downloadCSV } from "./assets/core/io.js";
+import { normalizeJan } from "./assets/core/normalize.js";
+import { parsePeriodFixedYM, dateKey } from "./assets/core/period.js";
+import { save, load } from "./assets/core/state.js";
+
+let settings = await readJson("./config/settings.json");
+const log = document.getElementById("log");
+function clean(s){ return String(s??"").replace(/[\r\n]+/g," ").trim(); }
+
+document.getElementById("run").addEventListener("click", async ()=>{
+  const f = document.getElementById("fileP").files[0];
+  if (!f) return appendLog(log, "p.xlsx が未選択です");
+  const buf = await f.arrayBuffer();
+  const wb = XLSX.read(buf, {type:"array"});
+  const ws = wb.Sheets[settings.xlsx_sheet_name];
+  if (!ws) throw new Error("Sheet not found: " + settings.xlsx_sheet_name);
+  const rows = XLSX.utils.sheet_to_json(ws, {defval:""});
+
+  const year = settings.target_year, month = settings.target_month;
+  const C = settings.p_columns;
+  const flyerMaster = new Map();
+  const items = [];
+  const storeTokens = new Map();
+  const rule = settings.flyer_type_rule;
+
+  for (const r of rows) {
+    const flyer_id = clean(r[C.flyer_id]);
+    if (!flyer_id) continue;
+
+    if (!flyerMaster.has(flyer_id)) {
+      const flyer_type = flyer_id.includes(rule.if_filename_contains) ? rule.then_type : rule.else_type;
+      const raw = clean(r[C.flyer_period]);
+      const p = parsePeriodFixedYM(raw, year, month);
+      flyerMaster.set(flyer_id, {
+        flyer_id, flyer_type,
+        flyer_period_raw: raw,
+        flyer_start: p.start ? dateKey(p.start) : "",
+        flyer_end: p.end ? dateKey(p.end) : ""
+      });
+    }
+
+    const tok = clean(r[C.store_token]);
+    if (tok && !storeTokens.has(flyer_id)) storeTokens.set(flyer_id, tok);
+
+    const jan = normalizeJan(r[C.jan]);
+    if (jan) {
+      items.push({
+        flyer_id, jan,
+        item_period_raw: clean(r[C.item_period]),
+        product_name: clean(r[C.product_name]),
+        sale_theme: clean(r[C.sale_theme]),
+        dept_code: clean(r[C.dept_code]),
+        price_base: clean(r[C.price_base]),
+        price_tax: clean(r[C.price_tax]),
+        margin: clean(r[C.margin])
+      });
+    }
+  }
+
+  const masterArr = Array.from(flyerMaster.values());
+  const tokArr = Array.from(storeTokens.entries()).map(([flyer_id, store_token_raw])=>({flyer_id, store_token_raw}));
+
+  await save("flyer_master", masterArr);
+  await save("flyer_items", items);
+  await save("flyer_store_tokens", tokArr);
+
+  appendLog(log, `master=${masterArr.length} items=${items.length} tokens=${tokArr.length}`);
+});
+
+document.getElementById("dlItems").addEventListener("click", async ()=>{
+  const items = await load("flyer_items") || [];
+  if (!items.length) return appendLog(log, "items がありません");
+  downloadCSV("flyer_items_normalized.csv", items);
+});
+document.getElementById("dlMaster").addEventListener("click", async ()=>{
+  const master = await load("flyer_master") || [];
+  if (!master.length) return appendLog(log, "master がありません");
+  downloadCSV("flyer_master.csv", master);
+});
+</script>
+</body></html>

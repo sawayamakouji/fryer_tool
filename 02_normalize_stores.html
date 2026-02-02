@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="ja"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>02 店舗正規化</title>
+<link rel="stylesheet" href="./assets/app.css"/>
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head><body>
+<header>
+  <div>
+    <h1>チラシ×POS ローカル処理ツール（分割版）</h1>
+    <small>本雛形はCDN依存。オフライン化する場合は script src をローカルに変更。</small>
+  </div>
+  <nav>
+    <a href="./index.html">index</a>
+    <a href="./01_import_items.html">01 商品</a>
+    <a href="./02_normalize_stores.html">02 店舗</a>
+    <a href="./03_parse_periods.html">03 期間</a>
+    <a href="./04_join_pos.html">04 結合</a>
+  </nav>
+</header>
+<div class="row">
+  <div class="card">
+    <h3>入力</h3>
+    <label>shoplist.csv</label>
+    <input id="fileShop" type="file" accept=".csv"/>
+    <div style="margin-top:12px;">
+      <button id="run">02 実行</button>
+      <button id="dlStores">store CSV</button>
+      <button id="dlUnresolved">未解決CSV</button>
+      <button id="dlTokenMap">token対応表CSV</button>
+    </div>
+    <small>未解決トークンを見て、config/store_rules.json と config/token_aliases.json を更新していく想定です。</small>
+  </div>
+  <div class="card">
+    <h3>未解決トークン（最大500件表示）</h3>
+    <div id="stats"></div>
+    <div style="max-height:320px; overflow:auto;">
+      <table id="tbl"><thead><tr><th>flyer_id</th><th>token</th><th>raw</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+  <div class="card"><h3>ログ</h3><pre id="log"></pre></div>
+</div>
+<script type="module">
+import { readJson, appendLog, downloadCSV } from "./assets/core/io.js";
+import { nfkc, stripAffixes, normalizeStoreId } from "./assets/core/normalize.js";
+import { load, save } from "./assets/core/state.js";
+
+const log = document.getElementById("log");
+const stats = document.getElementById("stats");
+const tbody = document.querySelector("#tbl tbody");
+
+const SETTINGS = (await readJson("./config/settings.json").catch(()=>({}))) || {};
+const storeRules = (await readJson("./config/store_rules.json").catch(()=>({}))) || {};
+const tokenAliases = (await readJson("./config/token_aliases.json").catch(()=>({}))) || {};
+// Defaults (if settings.json omits keys)
+const PREFIXES = Array.isArray(SETTINGS.strip_prefixes) ? SETTINGS.strip_prefixes : ["MV","ＭＶ","札幌","旭川","函館","苫小牧","帯広","北見","釧路","小樽"];
+const SUFFIXES = Array.isArray(SETTINGS.strip_suffixes) ? SETTINGS.strip_suffixes : ["店"];
+const SPLIT_RE = (() => {
+  const rx = SETTINGS.token_split_delimiters_regex;
+  try { return new RegExp(rx); } catch(_) { return /[・、,／\s]+/g; }
+})();
+
+function normToken(raw){
+  let t = nfkc(String(raw||"")).trim();
+  const nmap = tokenAliases.normalize || {};
+  if (t in nmap) t = nmap[t];
+  return t.replace(/[、,／\s]+/g,"・").replace(/・+/g,"・");
+}
+function splitTokens(raw){
+  const t = normToken(raw);
+  return t.split(SPLIT_RE).map(x=>x.trim()).filter(Boolean);
+}
+function isDrop(raw){
+  return (SETTINGS.drop_tokens_containing || []).some(w=>String(raw||"").includes(w));
+}
+async function readCsv(file){
+  return new Promise((resolve,reject)=>Papa.parse(file,{header:true,skipEmptyLines:true,complete:r=>resolve(r.data),error:reject}));
+}
+function pickCol(obj, cands){ for (const c of cands) if (c in obj) return c; return null; }
+function buildShopIndex(shops){
+  const sample = shops[0]||{};
+  // Accept both English headers (store_id/store_name/store_format) and Japanese headers (店コード/店名/業態)
+  const cId = pickCol(sample,["store_id","StoreID","店舗コード","店コード","storeCode","StoreCode"]);
+  const cName = pickCol(sample,["store_name","StoreName","店舗名","店名","storeName"]);
+  const cFmt = pickCol(sample,["store_format","StoreFormat","フォーマット","業態","format","業態区分"]);
+
+  const byExact = new Map();          // exact store_name -> store
+  const byStripped = new Map();       // stripped name -> [store]
+  const all = [];
+
+      const prefixes = PREFIXES;
+  const suffixes = SUFFIXES;
+  for (const r of shops){
+    const store_id = normalizeStoreId(r[cId]);
+    const store_name = nfkc(String(r[cName]||"")).trim();
+    const store_format = nfkc(String(r[cFmt]||"")).trim();
+    if (!store_id || !store_name) continue;
+    const store = {store_id, store_name, store_format};
+    byExact.set(store_name, store);
+    all.push(store);
+
+    const stripped = stripAffixes(store_name, prefixes, suffixes);
+    if (!byStripped.has(stripped)) byStripped.set(stripped, []);
+    byStripped.get(stripped).push(store);
+  }
+  return {byExact, byStripped, all};
+}
+function expandSet(def, all){
+  const fmts = new Set(def.store_format || []);
+  return all.filter(s=>fmts.has(s.store_format));
+}
+
+function detectExplicitFormatHint(token, raw){
+  const s = (String(token||'') + ' ' + String(raw||'')).toUpperCase();
+  if (s.includes('GMS')) return 'GMS';
+  if (s.includes('SM') || s.includes('MV')) return 'SM';
+  return null;
+}
+function preferByFlyerType(stores, flyer_type, explicitHint=null){
+  if (!stores || !stores.length) return [];
+
+  // Strong constraint: resolve by format first.
+  // explicitHint (from token/raw) overrides flyer_type.
+  let wantFormats = null;
+  if (explicitHint === 'GMS') wantFormats = ['GMS'];
+  else if (explicitHint === 'SM') wantFormats = ['SM','MV'];
+  else if (flyer_type === 'MV') wantFormats = ['SM','MV'];
+  else if (flyer_type === 'GMS') wantFormats = ['GMS'];
+
+  let base = stores;
+  if (wantFormats){
+    const filtered = stores.filter(s => wantFormats.includes(String(s.store_format||'')));
+
+    // Fallback across formats ONLY when no candidates exist in the desired formats.
+    // This solves cases like "北郷/南平岸" where a GMS flyer has no GMS store but has a unique SM/MV store.
+    if (!filtered.length){
+      let oppositeFormats = null;
+      if (wantFormats.length === 1 && wantFormats[0] === 'GMS') oppositeFormats = ['SM','MV'];
+      else if (wantFormats.includes('SM') || wantFormats.includes('MV')) oppositeFormats = ['GMS'];
+
+      if (oppositeFormats){
+        const fallback = stores.filter(s => oppositeFormats.includes(String(s.store_format||'')));
+        // Accept only when uniquely identified to avoid mis-assignments across formats.
+        if (fallback.length === 1){
+          base = fallback;
+        } else {
+          return []; // unresolved (ambiguous or none)
+        }
+      } else {
+        return []; // unresolved
+      }
+    } else {
+      base = filtered;
+    }
+  }
+
+  // If multiple remain, pick the shortest store_name (usually the most canonical)
+  base = [...base].sort((a,b)=> (a.store_name.length - b.store_name.length) || String(a.store_id).localeCompare(String(b.store_id)));
+  return [base[0]];
+}
+
+// Infer flyer_type from flyer_id as a guardrail.
+// Rule: if flyer_id includes 'SM' (half/full-width) then treat as MV (SM flyer).
+function inferFlyerTypeFromFlyerId(flyer_id){
+  const s = String(flyer_id||"");
+  // normalize fullwidth to halfwidth for S/M
+  const norm = s.replace(/[Ｓｓ]/g,"S").replace(/[Ｍｍ]/g,"M");
+  if (norm.toUpperCase().includes("SM")) return "MV";
+  return "GMS";
+}
+
+
+function resolveToken(token, shopIndex, flyer_type, raw){
+  const explicitHint = detectExplicitFormatHint(token, raw);
+  const exp = storeRules.token_expansions?.[token];
+  if (exp){
+    let stores = [];
+    for (const e of exp){
+      if (typeof e === "string"){
+        if (e.startsWith("@")){
+          const setDef = storeRules.sets?.[e];
+          if (setDef) stores.push(...expandSet(setDef, shopIndex.all));
+        } else {
+                    const base = e.replace(/店$/,'');
+          const s = shopIndex.byExact.get(e) || shopIndex.byExact.get(base) || shopIndex.byExact.get(base+'店');
+          if (s) stores.push(s);
+        }
+      } else if (e && typeof e === "object" && e.store_id){
+        const hit = shopIndex.all.find(s=>s.store_id===String(e.store_id));
+        if (hit) stores.push(hit);
+      }
+    }
+    const uniq = new Map(); for (const s of stores) uniq.set(s.store_id, s);
+    return {stores: preferByFlyerType(Array.from(uniq.values()), flyer_type, explicitHint), method:"rule"};
+  }
+
+    const stripped = stripAffixes(token, PREFIXES, SUFFIXES);
+  // 1) exact stripped name match (most reliable)
+  const exactList = shopIndex.byStripped.get(stripped) || shopIndex.byStripped.get(stripped.replace(/店$/,"")) || [];
+  if (exactList.length) return {stores: preferByFlyerType([...exactList], flyer_type, explicitHint), method:"stripped"};
+
+  // 2) exact full-name match fallback
+  const candidates = [token, token+"店", stripped, stripped+"店"];
+  for (const c of candidates){
+    const s = shopIndex.byExact.get(c);
+    if (s) return {stores: preferByFlyerType([s], flyer_type, explicitHint), method:"name"};
+  }
+
+  // 3) suffix match fallback (e.g., 札幌平岸 endsWith 平岸 / 旭川春光 endsWith 春光)
+  const t = nfkc(String(stripped||token||"")).trim();
+  let ends = shopIndex.all.filter(s=>stripAffixes(s.store_name, PREFIXES, SUFFIXES).endsWith(t));
+  if (!ends.length) ends = shopIndex.all.filter(s=>stripAffixes(s.store_name, PREFIXES, SUFFIXES).includes(t));
+  if (ends.length) return {stores: preferByFlyerType([...ends], flyer_type, explicitHint), method:"fuzzy"};
+
+  return {stores:[], method:"unresolved"};
+}
+
+document.getElementById("run").addEventListener("click", async ()=>{
+  const fShop = document.getElementById("fileShop").files[0];
+  if (!fShop) return appendLog(log, "shoplist.csv 未選択");
+  const tokens = await load("flyer_store_tokens") || [];
+  if (!tokens.length) return appendLog(log, "01の保存データがありません");
+
+  const shops = await readCsv(fShop);
+  const shopIndex = buildShopIndex(shops);
+
+  const out = [];
+  const unresolved = [];
+
+  const tokenMap = []; // flyer_id × token × (matched store) mapping
+
+  for (const row of tokens){
+    if (isDrop(row.store_token_raw)) continue;
+    const toks = splitTokens(row.store_token_raw);
+    let stores = [];
+    for (const t of toks){
+      const res = resolveToken(t, shopIndex, inferFlyerTypeFromFlyerId(row.flyer_id), row.store_token_raw);
+      if (res.stores.length){
+        for (const s of res.stores){
+          stores.push({...s, _method: res.method});
+          tokenMap.push({
+            flyer_id: row.flyer_id,
+            store_token_raw: row.store_token_raw,
+            token: t,
+            token_stripped: stripAffixes(t, (tokenAliases.strip_prefixes||[]), (tokenAliases.strip_suffixes||[])),
+            store_id: s.store_id,
+            store_name: s.store_name,
+            store_format: s.store_format,
+            match_method: res.method || "auto",
+            notes: ""
+          });
+        }
+      } else {
+        unresolved.push({flyer_id: row.flyer_id, token: t, raw: row.store_token_raw});
+        tokenMap.push({
+          flyer_id: row.flyer_id,
+          store_token_raw: row.store_token_raw,
+          token: t,
+          token_stripped: stripAffixes(t, (tokenAliases.strip_prefixes||[]), (tokenAliases.strip_suffixes||[])),
+          store_id: "",
+          store_name: "",
+          store_format: "",
+          match_method: "unresolved",
+          notes: ""
+        });
+      }
+    }
+    const uniq = new Map();
+    for (const s of stores){
+      if (!uniq.has(s.store_id)) uniq.set(s.store_id, s);
+      else {
+        // prefer more reliable methods when duplicates exist
+        const rank = {rule:0, stripped:1, name:2, fuzzy:3, unresolved:99};
+        if ((rank[s._method] ?? 50) < (rank[uniq.get(s.store_id)._method] ?? 50)){
+          uniq.set(s.store_id, s);
+        }
+      }
+    }
+    for (const s of uniq.values()){
+      out.push({
+        flyer_id: row.flyer_id,
+        store_token_raw: row.store_token_raw,
+        store_id: s.store_id,
+        store_name: s.store_name,
+        store_format: s.store_format,
+        match_method: s._method || "auto"
+      });
+    }
+  }
+
+  await save("flyer_store_normalized", out);
+  await save("flyer_store_unresolved", unresolved);
+  await save("flyer_token_store_map", tokenMap);
+
+  tbody.innerHTML = "";
+  unresolved.slice(0, 500).forEach(r=>{
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${r.flyer_id}</td><td>${r.token}</td><td>${r.raw}</td>`;
+    tbody.appendChild(tr);
+  });
+  stats.innerHTML = `未解決: <span class="${unresolved.length ? "tag-ng":"tag-ok"}">${unresolved.length}</span>`;
+  appendLog(log, `out=${out.length} unresolved=${unresolved.length}`);
+});
+
+document.getElementById("dlStores").addEventListener("click", async ()=>{
+  const out = await load("flyer_store_normalized") || [];
+  if (!out.length) return appendLog(log, "store出力がありません");
+  downloadCSV("flyer_store_normalized.csv", out);
+});
+document.getElementById("dlUnresolved").addEventListener("click", async ()=>{
+  const out = await load("flyer_store_unresolved") || [];
+  if (!out.length) return appendLog(log, "未解決なし");
+  downloadCSV("flyer_store_unresolved_tokens.csv", out);
+});
+
+document.getElementById("dlTokenMap").addEventListener("click", async ()=>{
+  const out = await load("flyer_token_store_map") || [];
+  if (!out.length) return appendLog(log, "token対応表がありません（02 実行後に出力）");
+  downloadCSV("flyer_token_to_shoplist_map.csv", out);
+});
+</script>
+</body></html>
