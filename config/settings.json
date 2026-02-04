@@ -15,6 +15,23 @@
     "price_tax": "税込価格",
     "margin": "値入率"
   },
+  "p_columns_csv": {
+    "flyer_id": "ファイル名",
+    "flyer_period": "チラシ期間(元文字列 M2)",
+    "flyer_period_start": "チラシ開始日(M2)",
+    "flyer_period_end": "チラシ終了日(M2)",
+    "store_token": "実施店舗(R2)",
+    "jan": "商品情報Q(Q列)",
+    "item_period": "販売日付(元文字列 M)",
+    "item_period_start": "販売開始日(M列)",
+    "item_period_end": "販売終了日(M列)",
+    "product_name": "商品名(T列)",
+    "sale_theme": "セールステーマ(B列)",
+    "dept_code": "部門(T列ヘッダ)",
+    "price_base": "商品情報AA(AA列)",
+    "price_tax": "商品情報AB(AB列)",
+    "margin": ""
+  },
   "pos_columns_candidates": {
 "date": [
   "﻿Unnamed: 0",

@@ -22,8 +22,8 @@
 <div class="row">
   <div class="card">
     <h3>入力</h3>
-    <label>p.xlsx（★チラシ明細）</label>
-    <input id="fileP" type="file" accept=".xlsx"/>
+    <label>p.xlsx または CSV（★チラシ明細）</label>
+    <input id="fileP" type="file" accept=".xlsx,.csv"/>
     <div style="margin-top:12px;">
       <button id="run">01 実行</button>
       <button id="dlItems">items CSV</button>
@@ -42,18 +42,70 @@ import { save, load } from "./assets/core/state.js";
 let settings = await readJson("./config/settings.json");
 const log = document.getElementById("log");
 function clean(s){ return String(s??"").replace(/[\r\n]+/g," ").trim(); }
+function parseDateFlexible(val, fixedYear, fixedMonth) {
+  if (val === null || val === undefined) return null;
+  if (val instanceof Date && !Number.isNaN(val.getTime())) return val;
+  let s = String(val).trim();
+  if (!s) return null;
+  s = s.replace(/\s+/g, "").replace(/／/g, "/").replace(/-/g, "/");
+  let m = s.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/);
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  m = s.match(/^(\d{1,2})\/(\d{1,2})$/);
+  if (m) return new Date(fixedYear, Number(m[1]) - 1, Number(m[2]));
+  if (/^\d{4,6}$/.test(s)) {
+    const p = parsePeriodFixedYM(s, fixedYear, fixedMonth);
+    return p.start;
+  }
+  return null;
+}
+function formatMD(d) {
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+function resolvePeriod(row, rawKey, startKey, endKey, fixedYear, fixedMonth) {
+  const raw = rawKey ? clean(row[rawKey]) : "";
+  const start = startKey ? parseDateFlexible(row[startKey], fixedYear, fixedMonth) : null;
+  const end = endKey ? parseDateFlexible(row[endKey], fixedYear, fixedMonth) : null;
+  const rawFromDates = start || end
+    ? start && end
+      ? `${formatMD(start)}～${formatMD(end)}`
+      : formatMD(start || end)
+    : "";
+  const rawUse = raw || rawFromDates;
+  if (start || end) {
+    const s = start || end;
+    const e = end || start;
+    if (s && e && e < s) return { raw: rawUse, start: e, end: s };
+    return { raw: rawUse, start: s, end: e };
+  }
+  if (rawUse) {
+    const p = parsePeriodFixedYM(rawUse, fixedYear, fixedMonth);
+    return { raw: rawUse, start: p.start, end: p.end };
+  }
+  return { raw: rawUse, start: null, end: null };
+}
 
 document.getElementById("run").addEventListener("click", async ()=>{
   const f = document.getElementById("fileP").files[0];
-  if (!f) return appendLog(log, "p.xlsx が未選択です");
-  const buf = await f.arrayBuffer();
-  const wb = XLSX.read(buf, {type:"array"});
-  const ws = wb.Sheets[settings.xlsx_sheet_name];
-  if (!ws) throw new Error("Sheet not found: " + settings.xlsx_sheet_name);
-  const rows = XLSX.utils.sheet_to_json(ws, {defval:""});
+  if (!f) return appendLog(log, "p.xlsx / CSV が未選択です");
+  const isCsv = f.name.toLowerCase().endsWith(".csv");
+  let rows = [];
+  if (isCsv) {
+    rows = await new Promise((resolve, reject)=>Papa.parse(f, {
+      header: true,
+      skipEmptyLines: true,
+      complete: r => resolve(r.data),
+      error: reject
+    }));
+  } else {
+    const buf = await f.arrayBuffer();
+    const wb = XLSX.read(buf, {type:"array"});
+    const ws = wb.Sheets[settings.xlsx_sheet_name];
+    if (!ws) throw new Error("Sheet not found: " + settings.xlsx_sheet_name);
+    rows = XLSX.utils.sheet_to_json(ws, {defval:""});
+  }
 
   const year = settings.target_year, month = settings.target_month;
-  const C = settings.p_columns;
+  const C = isCsv ? settings.p_columns_csv : settings.p_columns;
   const flyerMaster = new Map();
   const items = [];
   const storeTokens = new Map();
@@ -65,11 +117,10 @@ document.getElementById("run").addEventListener("click", async ()=>{
 
     if (!flyerMaster.has(flyer_id)) {
       const flyer_type = flyer_id.includes(rule.if_filename_contains) ? rule.then_type : rule.else_type;
-      const raw = clean(r[C.flyer_period]);
-      const p = parsePeriodFixedYM(raw, year, month);
+      const p = resolvePeriod(r, C.flyer_period, C.flyer_period_start, C.flyer_period_end, year, month);
       flyerMaster.set(flyer_id, {
         flyer_id, flyer_type,
-        flyer_period_raw: raw,
+        flyer_period_raw: p.raw,
         flyer_start: p.start ? dateKey(p.start) : "",
         flyer_end: p.end ? dateKey(p.end) : ""
       });
@@ -80,9 +131,10 @@ document.getElementById("run").addEventListener("click", async ()=>{
 
     const jan = normalizeJan(r[C.jan]);
     if (jan) {
+      const itemPeriod = resolvePeriod(r, C.item_period, C.item_period_start, C.item_period_end, year, month);
       items.push({
         flyer_id, jan,
-        item_period_raw: clean(r[C.item_period]),
+        item_period_raw: itemPeriod.raw,
         product_name: clean(r[C.product_name]),
         sale_theme: clean(r[C.sale_theme]),
         dept_code: clean(r[C.dept_code]),
